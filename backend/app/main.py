@@ -1,0 +1,274 @@
+import io
+import sys
+from pathlib import Path
+
+import torch
+import timm
+from PIL import Image
+from torchvision import transforms
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from .recommendations import get_treatment
+from .gradcam_service import generate_gradcam
+
+
+# =========================
+# PATHS
+# =========================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+MODEL_PATH = (
+    PROJECT_ROOT
+    / "ml"
+    / "checkpoints"
+    / "best_efficientnet_b0.pth"
+)
+
+
+# =========================
+# DEVICE
+# =========================
+
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
+
+
+# =========================
+# CLASSES
+# =========================
+
+CLASS_NAMES = [
+    "Apple___Apple_scab",
+    "Apple___Black_rot",
+    "Apple___Cedar_apple_rust",
+    "Apple___healthy",
+    "Blueberry___healthy",
+    "Cherry_(including_sour)___Powdery_mildew",
+    "Cherry_(including_sour)___healthy",
+    "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot",
+    "Corn_(maize)___Common_rust_",
+    "Corn_(maize)___Northern_Leaf_Blight",
+    "Corn_(maize)___healthy",
+    "Grape___Black_rot",
+    "Grape___Esca_(Black_Measles)",
+    "Grape___Leaf_blight_(Isariopsis_Leaf_Spot)",
+    "Grape___healthy",
+    "Orange___Haunglongbing_(Citrus_greening)",
+    "Peach___Bacterial_spot",
+    "Peach___healthy",
+    "Pepper,_bell___Bacterial_spot",
+    "Pepper,_bell___healthy",
+    "Potato___Early_blight",
+    "Potato___Late_blight",
+    "Potato___healthy",
+    "Raspberry___healthy",
+    "Soybean___healthy",
+    "Squash___Powdery_mildew",
+    "Strawberry___Leaf_scorch",
+    "Strawberry___healthy",
+    "Tomato___Bacterial_spot",
+    "Tomato___Early_blight",
+    "Tomato___Late_blight",
+    "Tomato___Leaf_Mold",
+    "Tomato___Septoria_leaf_spot",
+    "Tomato___Spider_mites Two-spotted_spider_mite",
+    "Tomato___Target_Spot",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+    "Tomato___Tomato_mosaic_virus",
+    "Tomato___healthy",
+]
+
+
+# =========================
+# MODEL
+# =========================
+
+print("Loading AI model...")
+
+model = timm.create_model(
+    "efficientnet_b0",
+    pretrained=False,
+    num_classes=38
+)
+
+checkpoint = torch.load(
+    MODEL_PATH,
+    map_location=DEVICE
+)
+
+model.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+model = model.to(DEVICE)
+model.eval()
+
+print("Model loaded successfully.")
+print("Device:", DEVICE)
+
+
+# =========================
+# IMAGE TRANSFORM
+# =========================
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+# =========================
+# FASTAPI
+# =========================
+
+app = FastAPI(
+    title="AI Plant Doctor API",
+    description="Deep Learning plant disease detection API",
+    version="1.0.0"
+)
+app.mount(
+    "/gradcam",
+    StaticFiles(directory="ml/logs/gradcam"),
+    name="gradcam"
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================
+# HEALTH CHECK
+# =========================
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "AI Plant Doctor",
+        "model": "EfficientNet-B0",
+        "classes": 38
+    }
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "healthy",
+        "device": str(DEVICE),
+        "model_loaded": True
+    }
+
+
+# =========================
+# PREDICTION
+# =========================
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+
+    # Validate image
+    if not file.content_type:
+        raise HTTPException(
+            status_code=400,
+            detail="File type missing"
+        )
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload an image"
+        )
+
+    try:
+        contents = await file.read()
+
+        image = Image.open(
+            io.BytesIO(contents)
+        ).convert("RGB")
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image file"
+        )
+
+    # Preprocess
+    tensor = transform(image)
+    tensor = tensor.unsqueeze(0)
+    tensor = tensor.to(DEVICE)
+
+    # Prediction
+    with torch.no_grad():
+
+        output = model(tensor)
+
+        probabilities = torch.softmax(
+            output,
+            dim=1
+        )
+
+        confidence, prediction = torch.max(
+            probabilities,
+            dim=1
+        )
+
+    class_index = prediction.item()
+    class_name = CLASS_NAMES[class_index]
+    confidence_value = confidence.item()
+
+    # Parse class name
+    if "___" in class_name:
+
+        plant, disease = class_name.split(
+            "___",
+            1
+        )
+
+    else:
+
+        plant = "Unknown"
+        disease = class_name
+
+    # Treatment recommendation
+    treatment_info = get_treatment(class_name)
+    # Generate Grad-CAM visualization
+    gradcam_path = PROJECT_ROOT / "ml" / "logs" / "gradcam" / "gradcam_result.jpg"
+
+    generate_gradcam(
+        model=model,
+        image=image,
+        class_index=class_index,
+        device=DEVICE,
+        output_path=str(gradcam_path)
+    )
+
+    return {
+        "plant": plant,
+        "disease": disease,
+        "confidence": round(
+            confidence_value * 100,
+            2
+        ),
+        "class_index": class_index,
+        "model": "EfficientNet-B0",
+        "treatment": treatment_info,
+"gradcam_url": "/gradcam/gradcam_result.jpg"
+
+    }
